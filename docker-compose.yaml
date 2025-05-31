@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  youtube-bot:
+    build: .
+    container_name: youtube-discord-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - TZ=Asia/Jakarta
+    volumes:
+      # Mount database directory to persist data
+      - ./data:/app/data
+      # Mount logs directory (optional)
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+    # Health check (optional)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3; sqlite3.connect('/app/data/youtube_bot.db').close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  bot-data:
+    driver: local
