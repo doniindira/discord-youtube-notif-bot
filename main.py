@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import requests
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import re
 from typing import List, Dict, Optional
@@ -29,7 +29,9 @@ class YouTubeMonitor:
     def init_database(self):
         """Initialize SQLite database"""
         # Ensure directory exists
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -37,12 +39,13 @@ class YouTubeMonitor:
         # Table for sent notifications
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sent_notifications (
-                video_id TEXT PRIMARY KEY,
+                video_id TEXT,
                 channel_id TEXT,
                 title TEXT,
                 published_at TEXT,
                 notification_sent_at TEXT,
-                guild_id TEXT
+                guild_id TEXT,
+                PRIMARY KEY (video_id, guild_id)
             )
         ''')
         
@@ -66,6 +69,17 @@ class YouTubeMonitor:
                 youtube_channel_id TEXT,
                 youtube_channel_name TEXT,
                 added_at TEXT
+            )
+        ''')
+        
+        # Table to track last check time per channel
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS channel_last_check (
+                channel_id TEXT,
+                guild_id TEXT,
+                last_check_at TEXT,
+                last_video_id TEXT,
+                PRIMARY KEY (channel_id, guild_id)
             )
         ''')
         
@@ -170,9 +184,17 @@ class YouTubeMonitor:
             feed = feedparser.parse(response.content)
             
             videos = []
-            for entry in feed.entries[:5]:  # Get last 5 videos
+            for entry in feed.entries[:10]:  # Get last 10 videos for better coverage
                 video_id = entry.link.split('watch?v=')[-1]
-                published_at = datetime.strptime(entry.published, '%Y-%m-%dT%H:%M:%S%z').isoformat()
+                
+                # Handle different date formats
+                try:
+                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                        published_at = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).isoformat()
+                    else:
+                        published_at = datetime.strptime(entry.published, '%Y-%m-%dT%H:%M:%S%z').isoformat()
+                except:
+                    published_at = datetime.now(timezone.utc).isoformat()
                 
                 video_info = {
                     'video_id': video_id,
@@ -186,10 +208,12 @@ class YouTubeMonitor:
                 }
                 videos.append(video_info)
             
+            # Sort by published date (newest first)
+            videos.sort(key=lambda x: x['published_at'], reverse=True)
             return videos
             
         except Exception as e:
-            logger.error(f"Error fetching RSS feed: {e}")
+            logger.error(f"Error fetching RSS feed for {channel_id}: {e}")
             return []
     
     def check_if_live_stream(self, video_id: str) -> bool:
@@ -204,13 +228,15 @@ class YouTubeMonitor:
                     '"islivebroadcast":true',
                     '"islive":true',
                     'live now',
-                    '"islivecontent":true'
+                    '"islivecontent":true',
+                    '"liveBroadcastContent":"live"'
                 ]
                 return any(indicator in content for indicator in live_indicators)
             
             return False
             
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error checking live status for {video_id}: {e}")
             return False
 
 # Initialize YouTube Monitor
@@ -275,6 +301,18 @@ class YouTubeBotCog(commands.Cog):
             datetime.now().isoformat()
         ))
         
+        # Initialize last check tracking
+        cursor.execute('''
+            INSERT OR REPLACE INTO channel_last_check 
+            (channel_id, guild_id, last_check_at, last_video_id)
+            VALUES (?, ?, ?, ?)
+        ''', (
+            channel_info['channel_id'],
+            str(interaction.guild.id),
+            datetime.now().isoformat(),
+            ""
+        ))
+        
         conn.commit()
         conn.close()
         
@@ -294,18 +332,35 @@ class YouTubeBotCog(commands.Cog):
         conn = sqlite3.connect(yt_monitor.db_path)
         cursor = conn.cursor()
         
+        # Get channel info before deleting
+        cursor.execute('''
+            SELECT youtube_channel_id FROM monitored_channels 
+            WHERE guild_id = ? AND youtube_channel_username = ?
+        ''', (str(interaction.guild.id), channel_username))
+        
+        channel_info = cursor.fetchone()
+        
+        if not channel_info:
+            conn.close()
+            await interaction.response.send_message(f"❌ Channel `{channel_username}` tidak ditemukan dalam daftar monitoring!")
+            return
+        
+        # Delete monitored channel
         cursor.execute('''
             DELETE FROM monitored_channels 
             WHERE guild_id = ? AND youtube_channel_username = ?
         ''', (str(interaction.guild.id), channel_username))
         
-        if cursor.rowcount > 0:
-            conn.commit()
-            conn.close()
-            await interaction.response.send_message(f"✅ Channel `{channel_username}` berhasil dihapus dari monitoring!")
-        else:
-            conn.close()
-            await interaction.response.send_message(f"❌ Channel `{channel_username}` tidak ditemukan dalam daftar monitoring!")
+        # Delete last check tracking
+        cursor.execute('''
+            DELETE FROM channel_last_check 
+            WHERE guild_id = ? AND channel_id = ?
+        ''', (str(interaction.guild.id), channel_info[0]))
+        
+        conn.commit()
+        conn.close()
+        
+        await interaction.response.send_message(f"✅ Channel `{channel_username}` berhasil dihapus dari monitoring!")
     
     @discord.app_commands.command(name="list_channels", description="Lihat daftar channel yang dimonitor")
     async def list_channels(self, interaction: discord.Interaction):
@@ -371,6 +426,45 @@ class YouTubeBotCog(commands.Cog):
         embed = self.create_video_embed(video, is_live, is_test=True)
         await interaction.followup.send("🧪 **TEST NOTIFICATION**", embed=embed)
     
+    @discord.app_commands.command(name="debug_status", description="Cek status monitoring dan debugging info")
+    async def debug_status(self, interaction: discord.Interaction):
+        conn = sqlite3.connect(yt_monitor.db_path)
+        cursor = conn.cursor()
+        
+        # Get monitoring info
+        cursor.execute('''
+            SELECT m.youtube_channel_name, m.youtube_channel_id, 
+                   c.last_check_at, c.last_video_id
+            FROM monitored_channels m
+            LEFT JOIN channel_last_check c ON m.youtube_channel_id = c.channel_id 
+                AND m.guild_id = c.guild_id
+            WHERE m.guild_id = ?
+        ''', (str(interaction.guild.id),))
+        
+        channels = cursor.fetchall()
+        conn.close()
+        
+        embed = discord.Embed(
+            title="🔍 Debug Status",
+            color=0x00ff00
+        )
+        
+        embed.add_field(
+            name="Monitor Task Status",
+            value="✅ Running" if not self.monitor_task.is_running() else "❌ Stopped",
+            inline=False
+        )
+        
+        for name, channel_id, last_check, last_video in channels:
+            last_check_str = "Never" if not last_check else last_check
+            embed.add_field(
+                name=f"📺 {name}",
+                value=f"ID: `{channel_id}`\nLast Check: `{last_check_str}`\nLast Video: `{last_video or 'None'}`",
+                inline=False
+            )
+        
+        await interaction.response.send_message(embed=embed)
+    
     def create_video_embed(self, video_info: Dict, is_live: bool = False, is_test: bool = False) -> discord.Embed:
         """Create Discord embed for video notification"""
         title_prefix = "🔴 LIVE" if is_live else "📹 VIDEO BARU"
@@ -405,65 +499,96 @@ class YouTubeBotCog(commands.Cog):
         
         return embed
     
-    @tasks.loop(minutes=10)  # Check every 10 minutes
+    @tasks.loop(minutes=5)  # Check every 5 minutes for more frequent updates
     async def monitor_task(self):
         """Background task to monitor YouTube channels"""
         try:
+            logger.info("🔍 Starting monitor task...")
+            
             conn = sqlite3.connect(yt_monitor.db_path)
             cursor = conn.cursor()
             
             # Get all monitored channels
             cursor.execute('''
-                SELECT DISTINCT guild_id, notification_channel_id, youtube_channel_id, youtube_channel_name, youtube_channel_username
+                SELECT DISTINCT guild_id, notification_channel_id, youtube_channel_id, 
+                       youtube_channel_name, youtube_channel_username
                 FROM monitored_channels
             ''')
             
             monitored = cursor.fetchall()
             conn.close()
             
+            logger.info(f"Found {len(monitored)} channels to monitor")
+            
             for guild_id, notif_channel_id, yt_channel_id, yt_channel_name, yt_username in monitored:
                 try:
+                    logger.info(f"Checking channel: {yt_channel_name} for guild: {guild_id}")
+                    
                     # Get Discord channel
                     channel = self.bot.get_channel(int(notif_channel_id))
                     if not channel:
+                        logger.warning(f"Discord channel {notif_channel_id} not found")
                         continue
+                    
+                    # Get last check info
+                    conn = sqlite3.connect(yt_monitor.db_path)
+                    cursor = conn.cursor()
+                    
+                    cursor.execute('''
+                        SELECT last_video_id, last_check_at FROM channel_last_check 
+                        WHERE channel_id = ? AND guild_id = ?
+                    ''', (yt_channel_id, guild_id))
+                    
+                    last_check_info = cursor.fetchone()
+                    last_video_id = last_check_info[0] if last_check_info else ""
                     
                     # Get latest videos
                     videos = yt_monitor.get_latest_videos_from_rss(yt_channel_id, yt_channel_name)
                     
+                    if not videos:
+                        logger.warning(f"No videos found for {yt_channel_name}")
+                        conn.close()
+                        continue
+                    
+                    new_videos = []
+                    
+                    # Check for new videos
                     for video in videos:
-                        # Check if already notified
-                        conn = sqlite3.connect(yt_monitor.db_path)
-                        cursor = conn.cursor()
+                        # If this is the first time running, only notify about very recent videos (last 1 hour)
+                        if not last_video_id:
+                            try:
+                                published_time = datetime.fromisoformat(video['published_at'].replace('Z', '+00:00'))
+                                current_time = datetime.now(timezone.utc)
+                                
+                                if published_time < current_time - timedelta(hours=1):
+                                    continue
+                            except:
+                                continue
                         
+                        # Check if already notified
                         cursor.execute('''
                             SELECT video_id FROM sent_notifications 
                             WHERE video_id = ? AND guild_id = ?
                         ''', (video['video_id'], guild_id))
                         
                         if cursor.fetchone():
-                            conn.close()
                             continue
                         
-                        # Check if video is recent (within last 2 hours)
+                        # If we have a last video ID, only process videos newer than that
+                        if last_video_id and video['video_id'] == last_video_id:
+                            break
+                        
+                        new_videos.append(video)
+                    
+                    # Send notifications for new videos (reverse order - oldest first)
+                    for video in reversed(new_videos):
                         try:
-                            published_time = datetime.fromisoformat(video['published_at'].replace('Z', '+00:00'))
-                            current_time = datetime.now(published_time.tzinfo)
+                            # Check if live
+                            is_live = yt_monitor.check_if_live_stream(video['video_id'])
                             
-                            if published_time < current_time - timedelta(hours=2):
-                                conn.close()
-                                continue
-                        except:
-                            conn.close()
-                            continue
-                        
-                        # Check if live
-                        is_live = yt_monitor.check_if_live_stream(video['video_id'])
-                        
-                        # Send notification
-                        embed = self.create_video_embed(video, is_live)
-                        
-                        try:
+                            # Send notification
+                            embed = self.create_video_embed(video, is_live)
+                            
                             await channel.send(embed=embed)
                             
                             # Mark as sent
@@ -480,31 +605,47 @@ class YouTubeBotCog(commands.Cog):
                                 guild_id
                             ))
                             
-                            conn.commit()
-                            logger.info(f"Sent notification for: {video['title']} to {channel.guild.name}")
+                            logger.info(f"✅ Sent notification for: {video['title']} to {channel.guild.name}")
+                            
+                            # Small delay to avoid rate limits
+                            await asyncio.sleep(2)
                             
                         except discord.Forbidden:
-                            logger.error(f"No permission to send message to {channel.name} in {channel.guild.name}")
+                            logger.error(f"❌ No permission to send message to {channel.name} in {channel.guild.name}")
                         except Exception as e:
-                            logger.error(f"Error sending notification: {e}")
-                        
-                        conn.close()
-                        
-                        # Small delay to avoid rate limits
-                        await asyncio.sleep(2)
+                            logger.error(f"❌ Error sending notification: {e}")
+                    
+                    # Update last check info
+                    if videos:
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO channel_last_check 
+                            (channel_id, guild_id, last_check_at, last_video_id)
+                            VALUES (?, ?, ?, ?)
+                        ''', (
+                            yt_channel_id,
+                            guild_id,
+                            datetime.now().isoformat(),
+                            videos[0]['video_id']  # Most recent video
+                        ))
+                    
+                    conn.commit()
+                    conn.close()
                     
                     # Delay between channels
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(3)
                     
                 except Exception as e:
-                    logger.error(f"Error monitoring channel {yt_channel_name}: {e}")
+                    logger.error(f"❌ Error monitoring channel {yt_channel_name}: {e}")
+            
+            logger.info("✅ Monitor task completed")
             
         except Exception as e:
-            logger.error(f"Error in monitor task: {e}")
+            logger.error(f"❌ Error in monitor task: {e}")
     
     @monitor_task.before_loop
     async def before_monitor_task(self):
         await self.bot.wait_until_ready()
+        logger.info("🤖 Bot ready, starting monitor task...")
 
 class YouTubeBot(commands.Bot):
     def __init__(self):
