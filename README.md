@@ -112,6 +112,7 @@ project/
 ```bash
 # Required
 BOT_TOKEN=your_discord_bot_token_here
+YOUTUBE_API_KEY=your_youtube_api_token_here
 
 # Optional
 TZ=Asia/Jakarta
